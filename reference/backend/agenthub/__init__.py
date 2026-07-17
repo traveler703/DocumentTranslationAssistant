@@ -1,2 +1,0 @@
-"""AgentHub backend package."""
-
