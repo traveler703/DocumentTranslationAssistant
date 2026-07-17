@@ -1,0 +1,16 @@
+.env
+.venv/
+.idea/
+.DS_Store
+
+__pycache__/
+*.py[cod]
+.pytest_cache/
+backend/agenthub.sqlite3
+
+node_modules/
+dist/
+.vite/
+
+projects/*
+!projects/.gitkeep

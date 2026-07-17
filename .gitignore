@@ -1,0 +1,44 @@
+# 忽略依赖目录
+node_modules/
+__pycache__/
+*.py[cod]
+*$py.class
+
+# 忽略构建产物
+dist/
+build/
+*.egg-info/
+
+# 忽略环境文件
+.env
+.env.local
+.env.*.local
+
+# 忽略编辑器配置
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# 忽略系统文件
+.DS_Store
+Thumbs.db
+
+# 忽略日志文件
+*.log
+logs/
+
+# 忽略上传和输出文件
+backend/uploads/
+backend/outputs/
+backend/temp/
+
+# 忽略测试覆盖率
+coverage/
+.coverage
+htmlcov/
+
+# 忽略虚拟环境
+venv/
+.venv/
+env/
