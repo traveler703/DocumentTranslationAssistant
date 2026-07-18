@@ -3,6 +3,7 @@ PDF处理服务 - 提取和生成PDF
 """
 import fitz  # PyMuPDF
 import re
+import os
 from typing import List, Dict, Any, Optional, Tuple
 from pathlib import Path
 import io
@@ -27,6 +28,8 @@ class TextLine:
     """文本行"""
     spans: List[TextSpan]
     bbox: Tuple[float, float, float, float]
+    direction: Tuple[float, float] = (1.0, 0.0)
+    writing_mode: int = 0
     
     @property
     def text(self) -> str:
@@ -116,7 +119,12 @@ class PDFProcessor:
         )
         
         # 提取文本块
-        blocks = page.get_text("dict", flags=fitz.TEXT_PRESERVE_WHITESPACE)["blocks"]
+        text_flags = (
+            fitz.TEXT_PRESERVE_WHITESPACE
+            | fitz.TEXT_PRESERVE_LIGATURES
+            | getattr(fitz, "TEXT_PRESERVE_IMAGES", 0)
+        )
+        blocks = page.get_text("dict", flags=text_flags)["blocks"]
         
         # 检测页眉页脚区域
         header_bbox, footer_bbox = self._detect_header_footer(blocks, rect.height)
@@ -169,7 +177,9 @@ class PDFProcessor:
             if spans:
                 line = TextLine(
                     spans=spans,
-                    bbox=tuple(line_data.get("bbox", (0, 0, 0, 0)))
+                    bbox=tuple(line_data.get("bbox", (0, 0, 0, 0))),
+                    direction=tuple(line_data.get("dir", (1.0, 0.0))),
+                    writing_mode=int(line_data.get("wmode", 0) or 0)
                 )
                 lines.append(line)
         
@@ -183,31 +193,20 @@ class PDFProcessor:
         """提取图片信息"""
         try:
             bbox = tuple(block.get("bbox", (0, 0, 0, 0)))
-            
-            # 获取图片列表
-            image_list = page.get_images()
-            if not image_list:
+            image_data = block.get("image", b"")
+            if not image_data:
                 return None
-            
-            # 找到与bbox最接近的图片
-            for img in image_list:
-                xref = img[0]
-                try:
-                    base_image = self.doc.extract_image(xref)
-                    image_data = base_image["image"]
-                    
-                    return ImageInfo(
-                        xref=xref,
-                        bbox=bbox,
-                        page_num=page_num,
-                        image_data=image_data,
-                        width=base_image.get("width", 0),
-                        height=base_image.get("height", 0)
-                    )
-                except Exception:
-                    continue
-            
-            return None
+
+            # dict 图像块已经包含与 bbox 对应的原始图像。旧实现对每个块都
+            # 返回页面的第一张图，导致图表被错误替换为 logo 或装饰图。
+            return ImageInfo(
+                xref=int(block.get("xref", 0) or 0),
+                bbox=bbox,
+                page_num=page_num,
+                image_data=image_data,
+                width=int(block.get("width", 0) or 0),
+                height=int(block.get("height", 0) or 0)
+            )
         except Exception:
             return None
     
@@ -391,6 +390,7 @@ class PDFGenerator:
     def __init__(self, source_pdf_path: str):
         self.source_path = Path(source_pdf_path)
         self.source_doc = fitz.open(str(self.source_path))
+        self.layout_warnings: List[str] = []
     
     def close(self):
         """关闭文档"""
@@ -406,7 +406,8 @@ class PDFGenerator:
         self,
         translations: Dict[int, List[Tuple[Tuple, str, dict]]],  # page_num -> [(bbox, translated_text, style)]
         output_path: str,
-        image_replacements: Optional[Dict[int, List[Tuple[Tuple, bytes]]]] = None  # page_num -> [(bbox, image_data)]
+        image_replacements: Optional[Dict[int, List[Tuple[Tuple, bytes]]]] = None,  # page_num -> [(bbox, image_data)]
+        target_lang: str = "zh-CN"
     ) -> str:
         """
         创建翻译后的PDF
@@ -419,74 +420,383 @@ class PDFGenerator:
         Returns:
             输出文件路径
         """
-        output_doc = fitz.open()
-        
-        for page_num in range(len(self.source_doc)):
-            # 复制原页面
-            source_page = self.source_doc[page_num]
-            new_page = output_doc.new_page(
-                width=source_page.rect.width,
-                height=source_page.rect.height
+        font_name, font_path = self._resolve_output_font(target_lang)
+        self.layout_warnings = []
+        output_path_obj = Path(output_path)
+        output_path_obj.parent.mkdir(parents=True, exist_ok=True)
+
+        # 直接克隆源文档再修改，保留 metadata、书签、链接和页面标注。
+        source_bytes = self.source_doc.tobytes(garbage=3, deflate=True)
+        output_doc = fitz.open(stream=source_bytes, filetype="pdf")
+
+        try:
+            for page_num, page in enumerate(output_doc):
+                # 位图先替换；随后写入 PDF 文本层，避免整页扫描图盖住译文。
+                if image_replacements and page_num in image_replacements:
+                    for bbox, image_data in image_replacements[page_num]:
+                        self._replace_image_region(page, bbox, image_data)
+
+                page_translations = translations.get(page_num, [])
+                if not page_translations:
+                    continue
+
+                prepared = self._prepare_page_translations(
+                    page,
+                    page_translations,
+                    font_name,
+                    font_path
+                )
+                prepared = self._validate_translations_on_page_clone(
+                    page,
+                    prepared,
+                    font_name,
+                    font_path
+                )
+                if not prepared:
+                    continue
+                original_links = page.get_links()
+
+                # 只有在译文确认能放入文本框之后，才移除对应原文。
+                for item in prepared:
+                    redaction_bboxes = item["style"].get(
+                        "redaction_bboxes", [item["bbox"]]
+                    )
+                    for redaction_bbox in redaction_bboxes:
+                        rect = fitz.Rect(redaction_bbox)
+                        if not rect.is_empty and not rect.is_infinite:
+                            page.add_redact_annot(rect, fill=False)
+
+                self._apply_redactions_preserving_graphics(page)
+                # Redaction 会重写页面内容流。此后再注册字体，避免未使用的
+                # 字体资源在清理内容流时被移除，导致预检和实际写入不一致。
+                if font_path:
+                    page.insert_font(fontname=font_name, fontfile=font_path)
+                self._restore_page_links(page, original_links)
+
+                for item in prepared:
+                    inserted = self._insert_translation_item(
+                        page, item, font_name, font_path
+                    )
+                    if inserted < 0:
+                        # 克隆页预演后通常不会进入这里。若底层 PDF 状态仍出现
+                        # 非确定性差异，立即从源 PDF 覆盖恢复这个文本块，而不是
+                        # 留下空白区域或让整份文档失败。
+                        restored = self._restore_original_item(
+                            page, page_num, item
+                        )
+                        action = "已恢复原文" if restored else "恢复原文失败"
+                        self.layout_warnings.append(
+                            f"第 {page_num + 1} 页有 1 个译文块实际写入失败，"
+                            f"{action}：{item['text'][:40]!r}"
+                        )
+
+            output_doc.save(
+                str(output_path_obj),
+                garbage=4,
+                deflate=True,
+                clean=True
             )
-            
-            # 复制原页面内容
-            new_page.show_pdf_page(new_page.rect, self.source_doc, page_num)
-            
-            # 应用文本翻译
-            if page_num in translations:
-                for bbox, text, style in translations[page_num]:
-                    self._replace_text_region(new_page, bbox, text, style)
-            
-            # 应用图片替换
-            if image_replacements and page_num in image_replacements:
-                for bbox, image_data in image_replacements[page_num]:
-                    self._replace_image_region(new_page, bbox, image_data)
-        
-        output_doc.save(output_path)
-        output_doc.close()
+        finally:
+            output_doc.close()
         
         return output_path
-    
-    def _replace_text_region(
+
+    def _prepare_page_translations(
         self,
         page: fitz.Page,
-        bbox: Tuple[float, float, float, float],
-        text: str,
-        style: dict
-    ):
-        """替换文本区域"""
-        rect = fitz.Rect(bbox)
-        
-        # 用白色矩形覆盖原文本
-        page.draw_rect(rect, color=(1, 1, 1), fill=(1, 1, 1))
-        
-        # 获取样式信息
-        font_size = style.get("font_size", 11)
-        font_name = style.get("font_name", "china-s")  # 使用内置中文字体
-        color = style.get("color", (0, 0, 0))
-        
-        # 插入翻译文本
-        # 自动调整字体大小以适应区域
-        text_writer = fitz.TextWriter(page.rect)
-        
+        translations: List[Tuple[Tuple, str, dict]],
+        font_name: str,
+        font_path: Optional[str]
+    ) -> List[dict]:
+        """在空白临时页上预排版，返回确认能够完整落版的项目。"""
+        scratch_doc = fitz.open()
+        scratch_page = scratch_doc.new_page(
+            width=page.rect.width,
+            height=page.rect.height
+        )
         try:
-            # 尝试使用文本适应区域的方式插入
-            page.insert_textbox(
+            if font_path:
+                scratch_page.insert_font(fontname=font_name, fontfile=font_path)
+
+            prepared: List[dict] = []
+            for bbox, text, style in translations:
+                clean_text = self._clean_translation(text)
+                rect = fitz.Rect(bbox)
+                if not clean_text or rect.is_empty or rect.is_infinite:
+                    continue
+                original_size = float(style.get("font_size", 11))
+                layout_rect = self._expand_layout_rect(
+                    rect, page.rect, original_size
+                )
+
+                fitted_size = self._fit_font_size(
+                    scratch_page,
+                    layout_rect,
+                    clean_text,
+                    font_name,
+                    font_path,
+                    original_size,
+                    style.get("color", (0, 0, 0)),
+                    float(style.get("lineheight", 1.0)),
+                    int(style.get("rotation", 0))
+                )
+                if fitted_size is None:
+                    # 单个极端标签不应让整份文档失败。该区域不加入 redaction，
+                    # 因而会安全保留原文，并通过任务提示告知用户。
+                    self.layout_warnings.append(
+                        f"第 {page.number + 1} 页有 1 个极小标签无法安全排版，"
+                        f"已保留原文：{clean_text[:40]!r}"
+                    )
+                    continue
+                prepared.append({
+                    "bbox": bbox,
+                    "layout_bbox": tuple(layout_rect),
+                    "text": clean_text,
+                    "style": style,
+                    "font_size": fitted_size
+                })
+            return prepared
+        finally:
+            scratch_doc.close()
+
+    def _validate_translations_on_page_clone(
+        self,
+        page: fitz.Page,
+        prepared: List[dict],
+        font_name: str,
+        font_path: Optional[str]
+    ) -> List[dict]:
+        """
+        在真实页面的克隆上执行完整写入流程。
+
+        空白页上的字体拟合无法覆盖原页面的内容流、字体资源和 redaction
+        重写行为。这里会逐轮排除真实预演仍失败的单个文本块；失败块没有在
+        正式页面上添加 redaction，因此原文会被完整保留。
+        """
+        candidates = list(prepared)
+        while candidates:
+            scratch_doc = fitz.open()
+            try:
+                scratch_doc.insert_pdf(
+                    page.parent,
+                    from_page=page.number,
+                    to_page=page.number,
+                    links=False,
+                    annots=False
+                )
+                scratch_page = scratch_doc[0]
+                for item in candidates:
+                    for redaction_bbox in item["style"].get(
+                        "redaction_bboxes", [item["bbox"]]
+                    ):
+                        rect = fitz.Rect(redaction_bbox)
+                        if not rect.is_empty and not rect.is_infinite:
+                            scratch_page.add_redact_annot(rect, fill=False)
+
+                self._apply_redactions_preserving_graphics(scratch_page)
+                if font_path:
+                    scratch_page.insert_font(
+                        fontname=font_name, fontfile=font_path
+                    )
+
+                failed_indexes = [
+                    index
+                    for index, item in enumerate(candidates)
+                    if self._insert_translation_item(
+                        scratch_page, item, font_name, font_path
+                    ) < 0
+                ]
+            finally:
+                scratch_doc.close()
+
+            if not failed_indexes:
+                return candidates
+
+            failed_set = set(failed_indexes)
+            for index in failed_indexes:
+                item = candidates[index]
+                self.layout_warnings.append(
+                    f"第 {page.number + 1} 页有 1 个译文块在真实页面预演中"
+                    f"无法安全排版，已保留原文：{item['text'][:40]!r}"
+                )
+            candidates = [
+                item
+                for index, item in enumerate(candidates)
+                if index not in failed_set
+            ]
+
+        return []
+
+    @staticmethod
+    def _insert_translation_item(
+        page: fitz.Page,
+        item: dict,
+        font_name: str,
+        font_path: Optional[str]
+    ) -> float:
+        """用与正式写入完全相同的参数插入一个译文块。"""
+        return page.insert_textbox(
+            fitz.Rect(item["layout_bbox"]),
+            item["text"],
+            fontsize=item["font_size"],
+            fontname=font_name,
+            fontfile=font_path,
+            color=item["style"].get("color", (0, 0, 0)),
+            align=fitz.TEXT_ALIGN_LEFT,
+            lineheight=item["style"].get("lineheight", 1.0),
+            rotate=item["style"].get("rotation", 0),
+            overlay=True
+        )
+
+    def _restore_original_item(
+        self,
+        page: fitz.Page,
+        page_num: int,
+        item: dict
+    ) -> bool:
+        """实际写入意外失败时，从源 PDF 精确覆盖恢复对应原文区域。"""
+        try:
+            restored_any = False
+            for redaction_bbox in item["style"].get(
+                "redaction_bboxes", [item["bbox"]]
+            ):
+                rect = fitz.Rect(redaction_bbox)
+                if rect.is_empty or rect.is_infinite:
+                    continue
+                page.show_pdf_page(
+                    rect,
+                    self.source_doc,
+                    page_num,
+                    clip=rect,
+                    keep_proportion=False,
+                    overlay=True
+                )
+                restored_any = True
+            return restored_any
+        except Exception:
+            return False
+
+    @staticmethod
+    def _expand_layout_rect(
+        rect: fitz.Rect,
+        page_rect: fitz.Rect,
+        font_size: float
+    ) -> fitz.Rect:
+        """
+        PDF 提取的 bbox 是字形边界，不是可直接排版的行框。
+        增加很小的行高余量，避免同字号文本因字体升降部差异被误判溢出。
+        """
+        padding = max(1.0, min(3.0, font_size * 0.3))
+        expanded = fitz.Rect(
+            rect.x0 - 0.5,
+            rect.y0 - padding * 0.25,
+            rect.x1 + 0.5,
+            rect.y1 + padding
+        )
+        return expanded & page_rect
+
+    @staticmethod
+    def _fit_font_size(
+        page: fitz.Page,
+        rect: fitz.Rect,
+        text: str,
+        font_name: str,
+        font_path: Optional[str],
+        original_size: float,
+        color: Tuple[float, float, float],
+        lineheight: float,
+        rotation: int
+    ) -> Optional[float]:
+        """逐级缩小字号，直到 PyMuPDF 确认文本框可完整容纳译文。"""
+        start = max(4.0, min(36.0, original_size))
+        minimum = max(3.0, min(6.0, start * 0.5))
+        size = start
+        while size >= minimum - 0.01:
+            shape = page.new_shape()
+            remaining = shape.insert_textbox(
                 rect,
                 text,
-                fontsize=font_size,
+                fontsize=size,
                 fontname=font_name,
+                fontfile=font_path,
                 color=color,
-                align=fitz.TEXT_ALIGN_LEFT
+                align=fitz.TEXT_ALIGN_LEFT,
+                lineheight=lineheight,
+                rotate=rotation
             )
-        except Exception:
-            # 如果失败，使用简单的文本插入
-            page.insert_text(
-                (bbox[0], bbox[1] + font_size),
-                text,
-                fontsize=font_size,
-                color=color
-            )
+            if remaining >= 0:
+                # 不向上取整临界字号，并额外留出 0.05pt 的排版余量。
+                # PyMuPDF 在真实页面重写内容流后的浮点计算可能略有差异。
+                return max(minimum, size - 0.05)
+            size -= 0.5
+        return None
+
+    @staticmethod
+    def _apply_redactions_preserving_graphics(page: fitz.Page):
+        """移除文本但保留与文本框相交的图片和表格线。"""
+        try:
+            page.apply_redactions(images=0, graphics=0)
+        except TypeError:
+            # PyMuPDF 1.23 尚不支持 graphics 参数。
+            page.apply_redactions(images=0)
+
+    @staticmethod
+    def _restore_page_links(page: fitz.Page, original_links: List[dict]):
+        """
+        PyMuPDF 会删除与 redaction 区域相交的链接。
+        清空幸存链接后按处理前快照重建，避免目录和文献 URL 失效。
+        """
+        for link in page.get_links():
+            page.delete_link(link)
+
+        allowed_keys = {
+            "kind", "from", "page", "to", "file", "uri",
+            "zoom", "name", "nameddest"
+        }
+        for link in original_links:
+            restored = {
+                key: value
+                for key, value in link.items()
+                if key in allowed_keys and value is not None
+            }
+            page.insert_link(restored)
+
+    @staticmethod
+    def _clean_translation(text: str) -> str:
+        """清除模型偶尔附带的代码围栏和空白，不改变正文内容。"""
+        cleaned = text.strip()
+        if cleaned.startswith("```") and cleaned.endswith("```"):
+            cleaned = re.sub(r"^```[^\n]*\n?", "", cleaned)
+            cleaned = re.sub(r"\n?```$", "", cleaned)
+        return cleaned.strip()
+
+    @staticmethod
+    def _resolve_output_font(target_lang: str) -> Tuple[str, Optional[str]]:
+        """选择并显式嵌入支持目标语言的字体，杜绝未定义 CID 字体。"""
+        if target_lang not in {"zh-CN", "zh-TW", "ja"}:
+            return "helv", None
+
+        configured = getattr(settings, "CJK_FONT_PATH", None)
+        candidates = [
+            configured,
+            os.getenv("DTA_CJK_FONT_PATH"),
+            "/System/Library/Fonts/Supplemental/Arial Unicode.ttf",
+            "/System/Library/Fonts/STHeiti Light.ttc",
+            "/System/Library/Fonts/STHeiti Medium.ttc",
+            "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
+            "/usr/share/fonts/truetype/noto/NotoSansCJK-Regular.ttc",
+            "/usr/share/fonts/opentype/noto/NotoSerifCJK-Regular.ttc",
+            "C:/Windows/Fonts/msyh.ttc",
+            "C:/Windows/Fonts/msgothic.ttc",
+        ]
+        for candidate in candidates:
+            if candidate and Path(candidate).is_file():
+                return "DTAUnicode", str(candidate)
+
+        raise RuntimeError(
+            "未找到支持中文/日文的 Unicode 字体。请设置 CJK_FONT_PATH "
+            "或 DTA_CJK_FONT_PATH（推荐 Noto Sans CJK）。"
+        )
     
     def _replace_image_region(
         self,
@@ -497,16 +807,14 @@ class PDFGenerator:
         """替换图片区域"""
         rect = fitz.Rect(bbox)
         
-        # 用白色覆盖原图片区域
-        page.draw_rect(rect, color=(1, 1, 1), fill=(1, 1, 1))
-        
-        # 插入新图片
-        page.insert_image(rect, stream=image_data)
+        # 新图片本身是不透明位图，直接覆盖可避免先画白框造成边缘白线。
+        page.insert_image(rect, stream=image_data, overlay=True)
     
     def create_bilingual_pdf(
         self,
         page_translations: Dict[int, str],  # page_num -> translated_text
-        output_path: str
+        output_path: str,
+        target_lang: str = "zh-CN"
     ) -> str:
         """
         创建双语对照PDF（原文+译文）
@@ -519,6 +827,7 @@ class PDFGenerator:
             输出文件路径
         """
         output_doc = fitz.open()
+        font_name, font_path = self._resolve_output_font(target_lang)
         
         for page_num in range(len(self.source_doc)):
             source_page = self.source_doc[page_num]
@@ -528,6 +837,8 @@ class PDFGenerator:
             new_height = source_page.rect.height
             
             new_page = output_doc.new_page(width=new_width, height=new_height)
+            if font_path:
+                new_page.insert_font(fontname=font_name, fontfile=font_path)
             
             # 左边放原文
             left_rect = fitz.Rect(0, 0, source_page.rect.width, new_height)
@@ -545,7 +856,7 @@ class PDFGenerator:
                     right_rect,
                     page_translations[page_num],
                     fontsize=11,
-                    fontname="china-s"
+                    fontname=font_name
                 )
         
         output_doc.save(output_path)

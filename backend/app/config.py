@@ -48,6 +48,9 @@ class Settings(BaseSettings):
     # PDF处理配置
     MAX_FILE_SIZE: int = 50 * 1024 * 1024  # 50MB
     ALLOWED_EXTENSIONS: set = {".pdf"}
+    CJK_FONT_PATH: Optional[Path] = None  # 可选：中文/日文字体（TTF/TTC/OTF）
+    OCR_ENABLED: bool = True
+    TESSERACT_CMD: Optional[Path] = None  # 可选：Tesseract 可执行文件路径
     
     # 服务器配置
     HOST: str = "0.0.0.0"

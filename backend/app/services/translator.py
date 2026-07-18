@@ -5,6 +5,7 @@
 import asyncio
 import uuid
 import re
+import logging
 from typing import Dict, List, Optional, Tuple, Callable
 from pathlib import Path
 from dataclasses import dataclass, field
@@ -23,6 +24,8 @@ MAX_CONCURRENT_TRANSLATIONS = 5  # 最大并行翻译数
 BATCH_SIZE_PAGES = 5  # 每批处理的页数
 MAX_TEXT_PER_BATCH = 8000  # 每批最大字符数（减少token使用）
 
+logger = logging.getLogger(__name__)
+
 
 @dataclass
 class TranslationTask:
@@ -40,6 +43,7 @@ class TranslationTask:
     message: str = ""
     error: Optional[str] = None
     abbreviations: Dict[str, str] = field(default_factory=dict)  # 缩写 -> 翻译
+    warnings: List[str] = field(default_factory=list)
 
 
 @dataclass
@@ -47,8 +51,16 @@ class PageBatch:
     """页面批次"""
     page_nums: List[int]
     layouts: List[PageLayout]
-    combined_text: str
-    block_map: List[Tuple[int, int]]  # [(page_idx, block_idx), ...]
+    items: List["TranslationUnit"]
+
+
+@dataclass
+class TranslationUnit:
+    """一个具有稳定 ID 的 PDF 文本块"""
+    unit_id: str
+    page_num: int
+    block_idx: int
+    block: TextBlock
 
 
 class TranslationService:
@@ -127,9 +139,22 @@ class TranslationService:
             
             # 6. 并行处理图片翻译（如果有）
             task.message = "正在处理图片中的文字..."
+            has_ocr_candidates = any(
+                (image.bbox[2] - image.bbox[0]) >= 30
+                and (image.bbox[3] - image.bbox[1]) >= 15
+                for image in images
+            )
+            if has_ocr_candidates and not self.image_processor.ocr_available:
+                self._add_task_warning(
+                    task, self.image_processor.ocr_unavailable_reason
+                )
             image_replacements = await self._translate_images_parallel(
                 images, llm_client, task
             )
+            if has_ocr_candidates and not self.image_processor.ocr_available:
+                self._add_task_warning(
+                    task, self.image_processor.ocr_unavailable_reason
+                )
             
             # 7. 生成翻译后的PDF
             task.message = "正在生成翻译文档..."
@@ -139,22 +164,39 @@ class TranslationService:
                 generator.create_translated_pdf(
                     translations=page_translations,
                     output_path=str(task.output_path),
-                    image_replacements=image_replacements if image_replacements else None
+                    image_replacements=image_replacements if image_replacements else None,
+                    target_lang=task.target_lang
                 )
+                for warning in generator.layout_warnings:
+                    self._add_task_warning(task, warning)
             
             task.status = TranslationStatus.COMPLETED
             task.progress = 100
-            task.message = "翻译完成"
+            if task.warnings:
+                task.message = (
+                    f"翻译完成（{len(task.warnings)} 项提示："
+                    f"{task.warnings[0]}）"
+                )
+            else:
+                task.message = "翻译完成"
             
         except Exception as e:
             task.status = TranslationStatus.FAILED
             task.error = str(e)
             task.message = f"翻译失败: {str(e)}"
-            raise
+            # 这是 FastAPI BackgroundTasks 中运行的任务。状态和错误已经写入
+            # task，继续抛出只会制造 “Exception in ASGI application”，
+            # 并不会让前端得到更多信息。
+            logger.exception("Translation task %s failed", task.task_id)
         
         finally:
             if hasattr(llm_client, 'close'):
-                await llm_client.close()
+                try:
+                    await llm_client.close()
+                except Exception:
+                    logger.exception(
+                        "Failed to close LLM client for task %s", task.task_id
+                    )
     
     async def _detect_abbreviations_once(
         self,
@@ -189,64 +231,69 @@ class TranslationService:
         self,
         page_layouts: List[PageLayout]
     ) -> List[PageBatch]:
-        """创建翻译批次，合并多页减少API调用"""
-        batches = []
-        current_batch_pages = []
-        current_batch_layouts = []
-        current_text_parts = []
-        current_block_map = []
+        """
+        创建带稳定块 ID 的翻译批次。
+
+        页眉、页脚、目录、表格和图中的矢量文字都属于普通 PDF 文本块，
+        因此不能像旧实现那样排除页眉页脚，也不能依赖双换行拆回段落。
+        """
+        batches: List[PageBatch] = []
+        current_pages: List[int] = []
+        current_layouts: List[PageLayout] = []
+        current_items: List[TranslationUnit] = []
         current_text_len = 0
+
+        def flush():
+            nonlocal current_pages, current_layouts, current_items, current_text_len
+            if current_items:
+                batches.append(PageBatch(
+                    page_nums=current_pages,
+                    layouts=current_layouts,
+                    items=current_items
+                ))
+            current_pages = []
+            current_layouts = []
+            current_items = []
+            current_text_len = 0
         
         for page_num, layout in enumerate(page_layouts):
-            page_text_parts = []
-            page_block_indices = []
-            
             for block_idx, block in enumerate(layout.text_blocks):
-                if block.block_type not in ("header", "footer"):
-                    text = block.text.strip()
-                    if text:
-                        page_text_parts.append(text)
-                        page_block_indices.append((len(current_batch_pages), block_idx))
-            
-            page_text = "\n\n".join(page_text_parts)
-            
-            # 检查是否需要开始新批次
-            if (current_text_len + len(page_text) > MAX_TEXT_PER_BATCH and current_batch_pages) or \
-               len(current_batch_pages) >= BATCH_SIZE_PAGES:
-                # 保存当前批次
-                if current_text_parts:
-                    batches.append(PageBatch(
-                        page_nums=current_batch_pages.copy(),
-                        layouts=current_batch_layouts.copy(),
-                        combined_text="\n\n---PAGE_BREAK---\n\n".join(current_text_parts),
-                        block_map=current_block_map.copy()
+                render_blocks = self._split_fragmented_block(block)
+                for part_idx, render_block in enumerate(render_blocks):
+                    text = render_block.text.strip()
+                    if not text or not self._should_translate(text):
+                        continue
+
+                    starts_new_page = page_num not in current_pages
+                    exceeds_page_limit = (
+                        starts_new_page
+                        and len(current_pages) >= BATCH_SIZE_PAGES
+                    )
+                    exceeds_text_limit = (
+                        current_items
+                        and current_text_len + len(text) > MAX_TEXT_PER_BATCH
+                    )
+                    if exceeds_page_limit or exceeds_text_limit:
+                        flush()
+
+                    if page_num not in current_pages:
+                        current_pages.append(page_num)
+                        current_layouts.append(layout)
+
+                    suffix = (
+                        f"-l{part_idx + 1}" if len(render_blocks) > 1 else ""
+                    )
+                    current_items.append(TranslationUnit(
+                        unit_id=(
+                            f"p{page_num + 1}-b{block_idx + 1}{suffix}"
+                        ),
+                        page_num=page_num,
+                        block_idx=block_idx,
+                        block=render_block
                     ))
-                # 重置
-                current_batch_pages = []
-                current_batch_layouts = []
-                current_text_parts = []
-                current_block_map = []
-                current_text_len = 0
-            
-            # 添加到当前批次
-            if page_text:
-                # 更新block_map的page_idx
-                for orig_page_idx, block_idx in page_block_indices:
-                    current_block_map.append((len(current_batch_pages), block_idx))
-                
-                current_batch_pages.append(page_num)
-                current_batch_layouts.append(layout)
-                current_text_parts.append(page_text)
-                current_text_len += len(page_text)
-        
-        # 保存最后一个批次
-        if current_text_parts:
-            batches.append(PageBatch(
-                page_nums=current_batch_pages,
-                layouts=current_batch_layouts,
-                combined_text="\n\n---PAGE_BREAK---\n\n".join(current_text_parts),
-                block_map=current_block_map
-            ))
+                    current_text_len += len(text)
+
+        flush()
         
         return batches
     
@@ -262,17 +309,23 @@ class TranslationService:
         
         # 使用信号量限制并发数
         semaphore = asyncio.Semaphore(MAX_CONCURRENT_TRANSLATIONS)
-        completed = [0]  # 使用列表以便在闭包中修改
+        completed_pages: set[int] = set()
+        progress_lock = asyncio.Lock()
         
         async def translate_batch(batch: PageBatch) -> Dict[int, List[Tuple[Tuple, str, dict]]]:
             async with semaphore:
                 result = await self._translate_single_batch(batch, llm_client, task)
-                completed[0] += len(batch.page_nums)
-                task.current_page = completed[0]
-                task.progress = (completed[0] / task.total_pages) * 90  # 留10%给PDF生成
-                task.message = f"已翻译 {completed[0]}/{task.total_pages} 页..."
-                if progress_callback:
-                    progress_callback(task.progress, task.message)
+                async with progress_lock:
+                    completed_pages.update(batch.page_nums)
+                    task.current_page = len(completed_pages)
+                    task.progress = (
+                        len(completed_pages) / max(1, task.total_pages)
+                    ) * 90
+                    task.message = (
+                        f"已翻译 {len(completed_pages)}/{task.total_pages} 页..."
+                    )
+                    if progress_callback:
+                        progress_callback(task.progress, task.message)
                 return result
         
         # 并行执行所有批次
@@ -280,7 +333,8 @@ class TranslationService:
         
         # 合并结果
         for result in results:
-            page_translations.update(result)
+            for page_num, entries in result.items():
+                page_translations.setdefault(page_num, []).extend(entries)
         
         return page_translations
     
@@ -290,63 +344,48 @@ class TranslationService:
         llm_client: BaseLLMClient,
         task: TranslationTask
     ) -> Dict[int, List[Tuple[Tuple, str, dict]]]:
-        """翻译单个批次"""
+        """按稳定 ID 翻译单个批次，确保每个块均有明确映射。"""
         result: Dict[int, List[Tuple[Tuple, str, dict]]] = {}
         
-        if not batch.combined_text.strip():
-            # 空批次，为每页返回空列表
+        if not batch.items:
             for page_num in batch.page_nums:
                 result[page_num] = []
             return result
-        
-        # 翻译合并的文本
-        translated_text = await llm_client.translate(
-            batch.combined_text,
+
+        translated_by_id = await llm_client.translate_segments(
+            [
+                {"id": item.unit_id, "text": item.block.text.strip()}
+                for item in batch.items
+            ],
             self._get_lang_name(task.source_lang),
             self._get_lang_name(task.target_lang),
             abbreviations=task.abbreviations
         )
-        
-        # 按页分割翻译结果
-        translated_pages = translated_text.split("---PAGE_BREAK---")
-        
-        # 为每页解析翻译结果
-        for page_idx, page_num in enumerate(batch.page_nums):
-            layout = batch.layouts[page_idx]
-            result[page_num] = []
-            
-            if page_idx < len(translated_pages):
-                page_translation = translated_pages[page_idx].strip()
-            else:
-                page_translation = ""
-            
-            # 获取该页的文本块
-            text_blocks = [
-                block for block in layout.text_blocks
-                if block.block_type not in ("header", "footer")
-            ]
-            
-            if not text_blocks:
+
+        for page_num in batch.page_nums:
+            result.setdefault(page_num, [])
+
+        for item in batch.items:
+            translated = translated_by_id.get(item.unit_id, "").strip()
+            if not translated:
+                # BaseLLMClient 会重试缺失项；这里仍保留最后一道防线。
+                translated = item.block.text
+            translated = await self._compact_translation_if_needed(
+                item,
+                translated,
+                llm_client,
+                task
+            )
+            # 模型名、公式、引用编号等经常无需翻译。若内容仅有空白差异，
+            # 不要重绘：保留原 PDF 字体可以避免数学字母等罕见字符变成方框。
+            if self._normalized_render_text(translated) == (
+                self._normalized_render_text(item.block.text)
+            ):
                 continue
-            
-            # 简单策略：如果只有一个块，直接使用整个翻译
-            # 如果有多个块，按段落分割
-            if len(text_blocks) == 1:
-                style = self._extract_text_style(text_blocks[0])
-                result[page_num].append((text_blocks[0].bbox, page_translation, style))
-            else:
-                # 按双换行分割
-                translated_parts = [p.strip() for p in page_translation.split("\n\n") if p.strip()]
-                
-                for i, block in enumerate(text_blocks):
-                    if i < len(translated_parts):
-                        translated = translated_parts[i]
-                    else:
-                        # 如果翻译部分不够，合并剩余的
-                        translated = "\n\n".join(translated_parts[i:]) if i < len(translated_parts) else block.text
-                    
-                    style = self._extract_text_style(block)
-                    result[page_num].append((block.bbox, translated, style))
+            style = self._extract_text_style(item.block)
+            result[item.page_num].append(
+                (item.block.bbox, translated, style)
+            )
         
         return result
     
@@ -359,7 +398,7 @@ class TranslationService:
         """并行处理图片翻译"""
         image_replacements: Dict[int, List[Tuple[Tuple, bytes]]] = {}
         
-        if not images:
+        if not images or not self.image_processor.ocr_available:
             return image_replacements
         
         # 按页分组
@@ -377,6 +416,13 @@ class TranslationService:
                 for image_info in page_images:
                     if not image_info.image_data:
                         continue
+
+                    display_width = image_info.bbox[2] - image_info.bbox[0]
+                    display_height = image_info.bbox[3] - image_info.bbox[1]
+                    # 论文中的 logo / 图标常以高分辨率小图片嵌入。对这些
+                    # 逐个 OCR 会产生大量噪声；可读标签通常已在 PDF 文本层。
+                    if display_width < 30 or display_height < 15:
+                        continue
                     
                     # 提取图片中的文字
                     text_regions = self.image_processor.extract_text_from_image(
@@ -387,25 +433,33 @@ class TranslationService:
                         continue
                     
                     # 批量翻译图片中的所有文字（减少API调用）
-                    all_texts = [r.text for r in text_regions if r.text.strip()]
-                    if not all_texts:
+                    if not any(r.text.strip() for r in text_regions):
                         continue
                     
-                    combined_image_text = "\n---IMG_TEXT_SEP---\n".join(all_texts)
-                    translated_combined = await llm_client.translate(
-                        combined_image_text,
+                    segments = [
+                        {
+                            "id": f"img-p{page_num + 1}-x{image_info.xref}-r{i + 1}",
+                            "text": region.text
+                        }
+                        for i, region in enumerate(text_regions)
+                        if region.text.strip()
+                    ]
+                    translated_by_id = await llm_client.translate_segments(
+                        segments,
                         self._get_lang_name(task.source_lang),
                         self._get_lang_name(task.target_lang),
                         abbreviations=task.abbreviations
                     )
-                    
-                    translated_parts = translated_combined.split("---IMG_TEXT_SEP---")
-                    
+
                     text_replacements = []
                     valid_regions = [r for r in text_regions if r.text.strip()]
                     for i, region in enumerate(valid_regions):
-                        if i < len(translated_parts):
-                            text_replacements.append((region, translated_parts[i].strip()))
+                        segment_id = (
+                            f"img-p{page_num + 1}-x{image_info.xref}-r{i + 1}"
+                        )
+                        translated = translated_by_id.get(segment_id, "").strip()
+                        if translated:
+                            text_replacements.append((region, translated))
                     
                     if text_replacements:
                         new_image_data = self.image_processor.replace_text_in_image(
@@ -428,18 +482,99 @@ class TranslationService:
                 image_replacements[page_num] = replacements
         
         return image_replacements
+
+    async def _compact_translation_if_needed(
+        self,
+        item: TranslationUnit,
+        translated: str,
+        llm_client: BaseLLMClient,
+        task: TranslationTask
+    ) -> str:
+        """狭小图表/表格标签若被扩写，则请求一次不展开缩写的短译文。"""
+        char_limit = self._estimate_compact_char_limit(item.block)
+        translated_len = len(re.sub(r"\s+", "", translated))
+        if char_limit >= 80 or translated_len <= char_limit:
+            return translated
+
+        try:
+            compact = await llm_client.translate(
+                item.block.text.strip(),
+                self._get_lang_name(task.source_lang),
+                self._get_lang_name(task.target_lang),
+                context=(
+                    "这是图表、目录或表格中的狭小标签。请给出最短且准确的译法；"
+                    "不要展开或解释缩写，通用缩写和模型名可直接保留；"
+                    f"最多 {char_limit} 个目标语言字符，只输出标签本身。"
+                ),
+                abbreviations=None
+            )
+        except Exception:
+            # 精简是补救步骤，不能因为一次额外请求失败而丢掉整批已完成译文。
+            return translated
+        compact = self._clean_compact_translation(compact)
+        if compact and len(re.sub(r"\s+", "", compact)) < translated_len:
+            return compact
+        return translated
+
+    def _estimate_compact_char_limit(self, block: TextBlock) -> int:
+        """根据文本方向、字号和框尺寸估算无需降到不可读字号的字符容量。"""
+        style = self._extract_text_style(block)
+        x0, y0, x1, y1 = block.bbox
+        width = max(1.0, x1 - x0)
+        height = max(1.0, y1 - y0)
+        font_size = max(3.0, float(style.get("font_size", 11)))
+        rotation = int(style.get("rotation", 0))
+
+        if rotation in (90, 270):
+            line_width, cross_size = height, width
+        else:
+            line_width, cross_size = width, height
+
+        visual_lines = max(
+            1,
+            len(block.lines),
+            int(cross_size / max(3.0, font_size * 0.85))
+        )
+        estimated = int(
+            (line_width / max(3.0, font_size * 0.6)) * visual_lines
+        )
+        source_len = len(re.sub(r"\s+", "", block.text))
+        return max(2, min(80, max(source_len, estimated)))
+
+    @staticmethod
+    def _clean_compact_translation(text: str) -> str:
+        """清除短译重试中模型偶尔添加的围栏、引号或说明前缀。"""
+        cleaned = text.strip()
+        cleaned = re.sub(r"^```[^\n]*\n?", "", cleaned)
+        cleaned = re.sub(r"\n?```$", "", cleaned)
+        cleaned = re.sub(
+            r"^(?:翻译|译文|短译)\s*[:：]\s*",
+            "",
+            cleaned,
+            flags=re.IGNORECASE
+        )
+        return cleaned.strip().strip("\"'“”‘’")
+
+    @staticmethod
+    def _normalized_render_text(text: str) -> str:
+        """仅忽略排版空白，用于判断模型是否实质修改了文本。"""
+        return re.sub(r"\s+", " ", text).strip()
+
+    @staticmethod
+    def _add_task_warning(task: TranslationTask, warning: str):
+        if warning and warning not in task.warnings:
+            task.warnings.append(warning)
     
     def _extract_text_style(self, block: TextBlock) -> dict:
         """提取文本样式"""
         style = {
             "font_size": 11,
-            "font_name": "china-s",
             "color": (0, 0, 0)
         }
         
         if block.lines and block.lines[0].spans:
             first_span = block.lines[0].spans[0]
-            style["font_size"] = max(8, min(24, first_span.font_size))
+            style["font_size"] = max(4, min(36, first_span.font_size))
             
             # 转换颜色
             color_int = first_span.color
@@ -447,8 +582,82 @@ class TranslationService:
             g = (color_int >> 8) & 0xFF
             b = color_int & 0xFF
             style["color"] = (r / 255, g / 255, b / 255)
+
+        # 逐行移除原文字，尽量避免擦掉表格边框、图形和底纹。
+        style["redaction_bboxes"] = [line.bbox for line in block.lines]
+        style["block_type"] = block.block_type
+        centers = sorted({
+            round((line.bbox[1] + line.bbox[3]) / 2, 2)
+            for line in block.lines
+        })
+        if len(centers) > 1:
+            gaps = sorted(
+                centers[index + 1] - centers[index]
+                for index in range(len(centers) - 1)
+            )
+            median_gap = gaps[len(gaps) // 2]
+            style["lineheight"] = max(
+                0.8,
+                min(1.3, median_gap / max(1.0, style["font_size"]))
+            )
+        else:
+            style["lineheight"] = 1.0
+        if block.lines:
+            direction_x, direction_y = block.lines[0].direction
+            if abs(direction_x) >= abs(direction_y):
+                style["rotation"] = 0 if direction_x >= 0 else 180
+            else:
+                style["rotation"] = 90 if direction_y < 0 else 270
         
         return style
+
+    @staticmethod
+    def _should_translate(text: str) -> bool:
+        """过滤纯数字/符号，保留所有包含自然语言字符的块。"""
+        # 标识符不是自然语言；交给模型反而容易破坏版本号和分类代码。
+        if re.match(r"^\s*arxiv\s*:\s*\d", text, re.IGNORECASE):
+            return False
+        if re.fullmatch(r"\s*(?:https?://|www\.)\S+\s*", text, re.IGNORECASE):
+            return False
+        return bool(re.search(r"[A-Za-z\u00C0-\u024F\u3040-\u30FF\u3400-\u9FFF]", text))
+
+    @staticmethod
+    def _split_fragmented_block(block: TextBlock) -> List[TextBlock]:
+        """
+        将目录制表位、表格多列等“同一视觉行的多个 PDF line”拆开。
+
+        普通正文仍按完整段落翻译以保留上下文；只有检测到同一 y 坐标上
+        存在多个独立 line 时才逐片段映射，从而保住目录页码和表格列位置。
+        """
+        lines = block.lines
+        has_rotated_lines = any(
+            abs(line.direction[1]) > abs(line.direction[0])
+            for line in lines
+        )
+        fragmented = (has_rotated_lines and len(lines) > 1) or any(
+            abs(
+                ((left.bbox[1] + left.bbox[3]) / 2)
+                - ((right.bbox[1] + right.bbox[3]) / 2)
+            )
+            <= max(1.0, min(
+                left.bbox[3] - left.bbox[1],
+                right.bbox[3] - right.bbox[1]
+            ) * 0.35)
+            for index, left in enumerate(lines)
+            for right in lines[index + 1:]
+        )
+        if not fragmented:
+            return [block]
+
+        return [
+            TextBlock(
+                lines=[line],
+                bbox=line.bbox,
+                block_type=block.block_type,
+                page_num=block.page_num
+            )
+            for line in lines
+        ]
     
     def _get_lang_name(self, lang_code: str) -> str:
         """获取语言名称"""

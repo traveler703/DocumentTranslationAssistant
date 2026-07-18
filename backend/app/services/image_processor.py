@@ -2,10 +2,19 @@
 图片处理服务 - 处理PDF中的图片文字翻译
 """
 import io
+import logging
+import os
+import shutil
+from pathlib import Path
 from typing import List, Dict, Tuple, Optional
 from PIL import Image, ImageDraw, ImageFont
 import pytesseract
 from dataclasses import dataclass
+
+from app.config import settings
+
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -19,7 +28,11 @@ class TextRegion:
 class ImageProcessor:
     """图片处理器"""
     
-    def __init__(self, tesseract_lang: str = "eng"):
+    def __init__(
+        self,
+        tesseract_lang: str = "eng",
+        tesseract_cmd: Optional[str] = None
+    ):
         """
         初始化图片处理器
         
@@ -27,6 +40,30 @@ class ImageProcessor:
             tesseract_lang: Tesseract OCR语言代码
         """
         self.tesseract_lang = tesseract_lang
+        configured_cmd = (
+            tesseract_cmd
+            or (str(settings.TESSERACT_CMD) if settings.TESSERACT_CMD else None)
+            or os.getenv("TESSERACT_CMD")
+        )
+        self.tesseract_cmd = (
+            self._find_tesseract(configured_cmd)
+            if settings.OCR_ENABLED
+            else None
+        )
+        self.ocr_available = self.tesseract_cmd is not None
+        self.ocr_unavailable_reason = (
+            ""
+            if self.ocr_available
+            else (
+                "OCR 已禁用"
+                if not settings.OCR_ENABLED
+                else "未检测到 Tesseract，可继续翻译 PDF 文字层，但会跳过纯位图 OCR"
+            )
+        )
+        self._logged_ocr_errors: set[str] = set()
+        if self.tesseract_cmd:
+            pytesseract.pytesseract.tesseract_cmd = self.tesseract_cmd
+
         # 语言代码映射
         self.lang_map = {
             "en": "eng",
@@ -37,6 +74,34 @@ class ImageProcessor:
             "zh-TW": "chi_tra",
             "ja": "jpn"
         }
+
+    @staticmethod
+    def _find_tesseract(configured_cmd: Optional[str]) -> Optional[str]:
+        """查找 Tesseract；显式配置无效时不静默改用其他版本。"""
+        if configured_cmd:
+            configured_path = Path(configured_cmd).expanduser()
+            if configured_path.is_file() and os.access(configured_path, os.X_OK):
+                return str(configured_path)
+            resolved = shutil.which(configured_cmd)
+            return resolved
+
+        candidates = [
+            shutil.which("tesseract"),
+            "/opt/homebrew/bin/tesseract",
+            "/usr/local/bin/tesseract",
+            "/opt/homebrew/opt/tesseract/bin/tesseract",
+            "C:/Program Files/Tesseract-OCR/tesseract.exe",
+        ]
+        for candidate in candidates:
+            if candidate and Path(candidate).is_file():
+                return str(candidate)
+        return None
+
+    def _warn_once(self, message: str):
+        """同一种 OCR 环境错误只记录一次，避免每张图刷一遍堆栈。"""
+        if message not in self._logged_ocr_errors:
+            logger.warning(message)
+            self._logged_ocr_errors.add(message)
     
     def set_source_language(self, lang_code: str):
         """设置源语言"""
@@ -52,8 +117,14 @@ class ImageProcessor:
         Returns:
             文字区域列表
         """
+        if not self.ocr_available:
+            self._warn_once(self.ocr_unavailable_reason)
+            return []
+
         # 打开图片
         image = Image.open(io.BytesIO(image_data))
+        if image.width < 40 or image.height < 15:
+            return []
         
         # 使用Tesseract进行OCR，获取详细信息
         try:
@@ -62,16 +133,25 @@ class ImageProcessor:
                 lang=self.tesseract_lang,
                 output_type=pytesseract.Output.DICT
             )
+        except pytesseract.TesseractNotFoundError:
+            self.ocr_available = False
+            self.ocr_unavailable_reason = (
+                "Tesseract 不可执行，可继续翻译 PDF 文字层，但会跳过纯位图 OCR"
+            )
+            self._warn_once(self.ocr_unavailable_reason)
+            return []
+        except pytesseract.TesseractError as e:
+            self._warn_once(
+                f"Tesseract OCR 不可用（语言包或运行配置错误）：{e}"
+            )
+            return []
         except Exception as e:
-            print(f"OCR error: {e}")
+            self._warn_once(f"图片 OCR 失败，已跳过该图片：{e}")
             return []
         
         # 解析结果
         regions = []
         n_boxes = len(data['text'])
-        
-        current_line_text = []
-        current_line_bbox = None
         
         for i in range(n_boxes):
             text = data['text'][i].strip()
@@ -186,8 +266,11 @@ class ImageProcessor:
         for region, translated_text in text_replacements:
             x, y, w, h = region.bbox
             
-            # 用背景色填充原文字区域
+            # 必须在覆盖原文之前采样颜色，否则永远只能得到填充后的颜色。
             bg_color = self._detect_background_color(image, (x, y, x + w, y + h))
+            text_color = self._detect_text_color(
+                image, (x, y, x + w, y + h), bg_color
+            )
             draw.rectangle([x, y, x + w, y + h], fill=bg_color)
             
             # 计算合适的字体大小
@@ -196,9 +279,6 @@ class ImageProcessor:
                 sized_font = ImageFont.truetype(font.path, font_size)
             except Exception:
                 sized_font = font
-            
-            # 获取文字颜色（使用原文字的主要颜色）
-            text_color = self._detect_text_color(image, (x, y, x + w, y + h), bg_color)
             
             # 绘制翻译文字
             # 计算文字位置以居中显示

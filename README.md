@@ -6,9 +6,10 @@
 
 - **多语言支持**：支持英文、法文、西班牙文、德文、简体中文、正体中文、日文互译
 - **智能布局识别**：自动识别分栏、段落分页，准确提取文本内容
-- **图表翻译**：自动识别并翻译图片中的文字，生成新图片替换原图
+- **全内容翻译**：正文、目录、表格、图注、脚注、页眉页脚和参考文献均使用稳定 ID 映射，模型漏项会自动补译
+- **图表翻译**：优先翻译 PDF 矢量文字层，并对纯位图/扫描图使用 OCR 后回写
 - **缩写处理**：首次出现的缩写自动展示全称和翻译
-- **保留排版**：翻译后的PDF尽可能保持原文档的格式和布局
+- **可靠排版**：显式嵌入 Unicode 字体、保留表格线和图片，并在移除原文前验证译文可完整落版
 - **多种翻译引擎**：支持OpenAI API、本地Claude CLI、Codex CLI
 
 ## 技术栈
@@ -31,9 +32,12 @@
 
 - Python 3.9+
 - Node.js 18+
-- Tesseract OCR（用于图片文字识别）
+- Tesseract OCR（可选，仅用于纯位图/扫描图文字识别）
 
 ### 安装 Tesseract
+
+Tesseract 是可选的系统程序。未安装时，正文、目录、表格、矢量图标签等
+PDF 文字层仍会正常翻译，系统只会跳过纯位图 OCR，并在任务完成信息中提示一次。
 
 ```bash
 # macOS
@@ -158,10 +162,27 @@ CODEX_CLI_PATH=/Applications/Codex.app/Contents/Resources/codex
 DEFAULT_SOURCE_LANG=en
 DEFAULT_TARGET_LANG=zh-CN
 
+# 中文/日文字体（可选；Linux 生产环境建议显式指定）
+CJK_FONT_PATH=/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc
+
+# 可选：关闭位图 OCR，或指定未加入 PATH 的 Tesseract
+OCR_ENABLED=true
+TESSERACT_CMD=/opt/homebrew/bin/tesseract
+
 # 服务器配置
 HOST=0.0.0.0
 PORT=8000
 DEBUG=true
+```
+
+若未配置 `CJK_FONT_PATH`，程序会依次查找 macOS 的 Arial Unicode /
+STHeiti、Linux 的 Noto Sans CJK 以及 Windows 的微软雅黑或日文字体。
+找不到可嵌入字体时任务会明确失败，不会再生成“先覆盖原文、译文却无法显示”的空白 PDF。
+
+### 运行后端测试
+
+```bash
+PYTHONPATH=backend python -m unittest -v backend.tests.test_translation_pipeline
 ```
 
 ### 翻译引擎配置

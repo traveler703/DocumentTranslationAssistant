@@ -6,6 +6,7 @@ import json
 import shutil
 import re
 import os
+import html
 from pathlib import Path
 from typing import Optional, List, Dict, Any
 from abc import ABC, abstractmethod
@@ -28,10 +29,91 @@ class BaseLLMClient(ABC):
         text: str,
         source_lang: str,
         target_lang: str,
-        context: Optional[str] = None
+        context: Optional[str] = None,
+        abbreviations: Optional[Dict[str, str]] = None
     ) -> str:
         """翻译文本"""
         pass
+
+    async def translate_segments(
+        self,
+        segments: List[Dict[str, str]],
+        source_lang: str,
+        target_lang: str,
+        abbreviations: Optional[Dict[str, str]] = None
+    ) -> Dict[str, str]:
+        """
+        批量翻译带稳定 ID 的文本片段。
+
+        PDF 中的目录项、表格单元格和注释往往会被模型合并或重新分段。
+        这里用不可翻译的 ID 建立映射；若模型遗漏了某个 ID，则只对遗漏
+        片段进行单独重试，绝不使用段落位置猜测映射关系。
+        """
+        if not segments:
+            return {}
+
+        expected = {
+            str(segment["id"]): str(segment.get("text", ""))
+            for segment in segments
+            if segment.get("id")
+        }
+        payload = "\n".join(
+            f'<dta-segment id="{html.escape(segment_id, quote=True)}">'
+            f"{html.escape(text, quote=False)}</dta-segment>"
+            for segment_id, text in expected.items()
+        )
+        context = (
+            "这是 PDF 布局片段批量翻译。必须逐个翻译每个 <dta-segment> "
+            "的正文，原样保留其 id、开始标签、结束标签和片段顺序；"
+            "不得合并、拆分、遗漏片段；尽量保留片段内部换行；"
+            "URL、编号、公式、代码和专有模型名保持原样；"
+            "不要输出标签之外的内容。"
+        )
+
+        raw_result = await self.translate(
+            payload,
+            source_lang,
+            target_lang,
+            context=context,
+            abbreviations=abbreviations
+        )
+        translated = self._parse_segment_response(raw_result, set(expected))
+
+        # 模型偶尔会漏掉标记。逐项补译比把剩余译文按换行猜回去安全得多。
+        for segment_id, source_text in expected.items():
+            if translated.get(segment_id, "").strip():
+                continue
+            translated[segment_id] = (
+                await self.translate(
+                    source_text,
+                    source_lang,
+                    target_lang,
+                    context="只翻译这个独立的 PDF 文本片段；不要添加解释。",
+                    abbreviations=abbreviations
+                )
+            ).strip()
+
+        return translated
+
+    @staticmethod
+    def _parse_segment_response(
+        response: str,
+        expected_ids: set[str]
+    ) -> Dict[str, str]:
+        """从模型响应中提取稳定 ID；忽略任何意外或重复的 ID。"""
+        if not response:
+            return {}
+
+        pattern = re.compile(
+            r'<dta-segment\s+id=["\']([^"\']+)["\']\s*>(.*?)</dta-segment>',
+            re.IGNORECASE | re.DOTALL
+        )
+        translated: Dict[str, str] = {}
+        for segment_id, text in pattern.findall(response):
+            segment_id = html.unescape(segment_id.strip())
+            if segment_id in expected_ids and segment_id not in translated:
+                translated[segment_id] = html.unescape(text.strip())
+        return translated
     
     @abstractmethod
     async def detect_abbreviations(
@@ -100,7 +182,9 @@ class OpenAIClient(BaseLLMClient):
 2. 专业术语要准确翻译
 3. 保持学术/专业文档的语言风格
 4. 如果遇到缩写，第一次出现时给出全称和翻译，格式为：缩写（全称，翻译）
-5. 不要添加额外的解释或注释，只输出翻译结果"""
+5. URL、电子邮箱、DOI、arXiv编号、引用编号、公式、数值、代码和模型名必须保持原样
+6. 目录项、表格单元格、图注、脚注和页眉页脚也要完整翻译
+7. 不要添加额外的解释或注释，只输出翻译结果"""
 
         if abbreviations:
             abbr_info = "\n".join([f"- {k}: {v}" for k, v in abbreviations.items()])
@@ -206,7 +290,9 @@ class ClaudeCLIClient(BaseLLMClient):
 2. 专业术语要准确翻译
 3. 保持学术/专业文档的语言风格
 4. 如果遇到缩写，第一次出现时给出全称和翻译，格式为：缩写（全称，翻译）
-5. 不要添加额外的解释或注释，只输出翻译结果"""
+5. URL、电子邮箱、DOI、arXiv编号、引用编号、公式、数值、代码和模型名必须保持原样
+6. 目录项、表格单元格、图注、脚注和页眉页脚也要完整翻译
+7. 不要添加额外的解释或注释，只输出翻译结果"""
 
         if abbreviations:
             abbr_info = "\n".join([f"- {k}: {v}" for k, v in abbreviations.items()])
@@ -372,7 +458,9 @@ class CodexCLIClient(BaseLLMClient):
 2. 专业术语要准确翻译
 3. 保持学术/专业文档的语言风格
 4. 如果遇到缩写，第一次出现时给出全称和翻译，格式为：缩写（全称，翻译）
-5. 不要添加额外的解释或注释，只输出翻译结果"""
+5. URL、电子邮箱、DOI、arXiv编号、引用编号、公式、数值、代码和模型名必须保持原样
+6. 目录项、表格单元格、图注、脚注和页眉页脚也要完整翻译
+7. 不要添加额外的解释或注释，只输出翻译结果"""
 
         if abbreviations:
             abbr_info = "\n".join([f"- {k}: {v}" for k, v in abbreviations.items()])
