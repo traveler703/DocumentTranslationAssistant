@@ -1,7 +1,8 @@
 """
 文件上传路由
 """
-from fastapi import APIRouter, UploadFile, File, HTTPException
+import json
+from fastapi import APIRouter, UploadFile, File, HTTPException, Query
 from fastapi.responses import FileResponse
 
 from app.config import settings
@@ -11,7 +12,9 @@ from app.utils.helpers import (
     save_upload_file, 
     is_allowed_file,
     get_upload_path,
-    get_output_path
+    get_output_path,
+    save_file_metadata,
+    get_file_metadata
 )
 from app.services.pdf_processor import PDFProcessor
 
@@ -52,6 +55,10 @@ async def upload_file(file: UploadFile = File(...)):
     file_id = generate_file_id()
     save_path = await save_upload_file(file, file_id)
     
+    # 保存原始文件名元数据
+    original_filename = file.filename or "document.pdf"
+    save_file_metadata(file_id, {"original_filename": original_filename})
+    
     # 获取PDF页数
     try:
         with PDFProcessor(str(save_path)) as processor:
@@ -67,6 +74,7 @@ async def upload_file(file: UploadFile = File(...)):
     return FileUploadResponse(
         file_id=file_id,
         filename=file.filename,
+        original_filename=original_filename,
         size=len(content),
         page_count=page_count
     )
@@ -87,9 +95,31 @@ async def download_file(file_id: str):
             detail="文件不存在或翻译尚未完成"
         )
     
+    # 获取元数据以构建正确的文件名
+    metadata = get_file_metadata(file_id)
+    original_filename = metadata.get("original_filename", "document.pdf") if metadata else "document.pdf"
+    target_lang = metadata.get("target_lang", "zh-CN") if metadata else "zh-CN"
+    
+    # 语言代码映射
+    lang_code_map = {
+        "en": "EN",
+        "fr": "FR",
+        "es": "ES",
+        "de": "DE",
+        "zh-CN": "CN",
+        "zh-TW": "TW",
+        "ja": "JP"
+    }
+    lang_suffix = lang_code_map.get(target_lang, "CN")
+    
+    # 去掉原文件名的扩展名，构建新文件名
+    import os
+    base_name = os.path.splitext(original_filename)[0]
+    download_filename = f"{base_name}_translated_{lang_suffix}.pdf"
+    
     return FileResponse(
         path=str(output_path),
-        filename=f"translated_{file_id}.pdf",
+        filename=download_filename,
         media_type="application/pdf"
     )
 

@@ -29,6 +29,7 @@ export interface LLMProviderInfo {
 export interface FileUploadResponse {
   file_id: string;
   filename: string;
+  original_filename: string;
   size: number;
   page_count: number;
   message: string;
@@ -43,6 +44,9 @@ export interface TranslationRequest {
   api_key?: string;
   api_base?: string;
   model?: string;
+  skip_references?: boolean;
+  skip_appendix?: boolean;
+  original_filename?: string;
 }
 
 // 翻译进度

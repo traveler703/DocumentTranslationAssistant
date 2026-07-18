@@ -13,12 +13,16 @@ interface TranslationConfigProps {
   apiKey: string;
   apiBase: string;
   model: string;
+  skipReferences: boolean;
+  skipAppendix: boolean;
   onSourceLangChange: (lang: LanguageCode) => void;
   onTargetLangChange: (lang: LanguageCode) => void;
   onLLMProviderChange: (provider: LLMProvider) => void;
   onApiKeyChange: (key: string) => void;
   onApiBaseChange: (base: string) => void;
   onModelChange: (model: string) => void;
+  onSkipReferencesChange: (skip: boolean) => void;
+  onSkipAppendixChange: (skip: boolean) => void;
   disabled?: boolean;
 }
 
@@ -29,12 +33,16 @@ export function TranslationConfig({
   apiKey,
   apiBase,
   model,
+  skipReferences,
+  skipAppendix,
   onSourceLangChange,
   onTargetLangChange,
   onLLMProviderChange,
   onApiKeyChange,
   onApiBaseChange,
   onModelChange,
+  onSkipReferencesChange,
+  onSkipAppendixChange,
   disabled = false,
 }: TranslationConfigProps) {
   const [languages, setLanguages] = useState<LanguageInfo[]>([]);
@@ -92,6 +100,36 @@ export function TranslationConfig({
                 </option>
               ))}
             </select>
+          </div>
+        </div>
+
+        {/* 内容过滤选项 */}
+        <div className="p-4 bg-gray-50 rounded-lg">
+          <label className="label mb-3">翻译范围设置</label>
+          <p className="text-xs text-gray-500 mb-3">
+            取消勾选以翻译这些部分（默认跳过以节省时间和成本）
+          </p>
+          <div className="space-y-3">
+            <label className="flex items-center space-x-3 cursor-pointer">
+              <input
+                type="checkbox"
+                checked={skipReferences}
+                onChange={(e) => onSkipReferencesChange(e.target.checked)}
+                disabled={disabled}
+                className="w-4 h-4 text-primary-600 border-gray-300 rounded focus:ring-primary-500"
+              />
+              <span className="text-sm text-gray-700">跳过参考文献（References）</span>
+            </label>
+            <label className="flex items-center space-x-3 cursor-pointer">
+              <input
+                type="checkbox"
+                checked={skipAppendix}
+                onChange={(e) => onSkipAppendixChange(e.target.checked)}
+                disabled={disabled}
+                className="w-4 h-4 text-primary-600 border-gray-300 rounded focus:ring-primary-500"
+              />
+              <span className="text-sm text-gray-700">跳过附录（Appendix）</span>
+            </label>
           </div>
         </div>
 

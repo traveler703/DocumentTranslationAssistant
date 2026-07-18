@@ -18,7 +18,7 @@ from app.models.schemas import (
 )
 from app.services.translator import translation_service
 from app.services.llm_client import create_llm_client
-from app.utils.helpers import get_upload_path
+from app.utils.helpers import get_upload_path, save_file_metadata
 
 
 router = APIRouter(prefix="/translation", tags=["翻译"])
@@ -69,12 +69,17 @@ async def start_translation(
             detail="使用OpenAI API需要提供API密钥"
         )
     
+    # 保存目标语言到元数据（用于下载时构建文件名）
+    save_file_metadata(request.file_id, {"target_lang": request.target_lang.value})
+    
     # 创建翻译任务
     task = await translation_service.create_task(
         file_id=request.file_id,
         source_path=upload_path,
         source_lang=request.source_lang.value,
-        target_lang=request.target_lang.value
+        target_lang=request.target_lang.value,
+        skip_references=request.skip_references,
+        skip_appendix=request.skip_appendix
     )
     
     # 创建LLM客户端

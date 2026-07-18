@@ -36,6 +36,8 @@ function App() {
   const [apiKey, setApiKey] = useState('');
   const [apiBase, setApiBase] = useState('');
   const [model, setModel] = useState('');
+  const [skipReferences, setSkipReferences] = useState(true);
+  const [skipAppendix, setSkipAppendix] = useState(true);
 
   // 翻译状态
   const [translationTask, setTranslationTask] = useState<TranslationProgress | null>(null);
@@ -82,6 +84,9 @@ function App() {
         api_key: apiKey || undefined,
         api_base: apiBase || undefined,
         model: model || undefined,
+        skip_references: skipReferences,
+        skip_appendix: skipAppendix,
+        original_filename: uploadedFile.original_filename,
       });
 
       setTranslationTask(task);
@@ -89,7 +94,7 @@ function App() {
     } catch (error) {
       setTranslationError((error as Error).message);
     }
-  }, [uploadedFile, sourceLang, targetLang, llmProvider, apiKey, apiBase, model]);
+  }, [uploadedFile, sourceLang, targetLang, llmProvider, apiKey, apiBase, model, skipReferences, skipAppendix]);
 
   // 翻译完成
   const handleTranslationComplete = useCallback((result: TranslationResult) => {
@@ -184,12 +189,16 @@ function App() {
                 apiKey={apiKey}
                 apiBase={apiBase}
                 model={model}
+                skipReferences={skipReferences}
+                skipAppendix={skipAppendix}
                 onSourceLangChange={setSourceLang}
                 onTargetLangChange={setTargetLang}
                 onLLMProviderChange={setLLMProvider}
                 onApiKeyChange={setApiKey}
                 onApiBaseChange={setApiBase}
                 onModelChange={setModel}
+                onSkipReferencesChange={setSkipReferences}
+                onSkipAppendixChange={setSkipAppendix}
               />
 
               {/* 错误提示 */}

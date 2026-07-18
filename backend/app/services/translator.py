@@ -36,6 +36,8 @@ class TranslationTask:
     output_path: Optional[Path] = None
     source_lang: str = "en"
     target_lang: str = "zh-CN"
+    skip_references: bool = True
+    skip_appendix: bool = True
     status: TranslationStatus = TranslationStatus.PENDING
     progress: float = 0.0
     current_page: int = 0
@@ -44,6 +46,9 @@ class TranslationTask:
     error: Optional[str] = None
     abbreviations: Dict[str, str] = field(default_factory=dict)  # 缩写 -> 翻译
     warnings: List[str] = field(default_factory=list)
+    # 用于跟踪是否进入了参考文献/附录区域
+    in_references_section: bool = field(default=False, init=False)
+    in_appendix_section: bool = field(default=False, init=False)
 
 
 @dataclass
@@ -75,7 +80,9 @@ class TranslationService:
         file_id: str,
         source_path: Path,
         source_lang: str,
-        target_lang: str
+        target_lang: str,
+        skip_references: bool = True,
+        skip_appendix: bool = True
     ) -> TranslationTask:
         """创建翻译任务"""
         task_id = str(uuid.uuid4())
@@ -94,6 +101,8 @@ class TranslationService:
             output_path=output_path,
             source_lang=source_lang,
             target_lang=target_lang,
+            skip_references=skip_references,
+            skip_appendix=skip_appendix,
             total_pages=total_pages
         )
         
@@ -129,8 +138,17 @@ class TranslationService:
             await self._detect_abbreviations_once(page_layouts, llm_client, task)
             
             # 4. 创建翻译批次（合并多页，减少API调用）
-            batches = self._create_translation_batches(page_layouts)
-            task.message = f"已创建 {len(batches)} 个翻译批次，开始并行翻译..."
+            # 会根据skip_references和skip_appendix设置跳过相应部分
+            batches = self._create_translation_batches(page_layouts, task)
+            
+            # 提供跳过内容的信息
+            skip_info = []
+            if task.skip_references:
+                skip_info.append("参考文献")
+            if task.skip_appendix:
+                skip_info.append("附录")
+            skip_msg = f"（跳过{'/'.join(skip_info)}）" if skip_info else ""
+            task.message = f"已创建 {len(batches)} 个翻译批次{skip_msg}，开始并行翻译..."
             
             # 5. 并行翻译文本批次
             page_translations = await self._translate_batches_parallel(
@@ -229,19 +247,26 @@ class TranslationService:
     
     def _create_translation_batches(
         self,
-        page_layouts: List[PageLayout]
+        page_layouts: List[PageLayout],
+        task: TranslationTask
     ) -> List[PageBatch]:
         """
         创建带稳定块 ID 的翻译批次。
 
         页眉、页脚、目录、表格和图中的矢量文字都属于普通 PDF 文本块，
         因此不能像旧实现那样排除页眉页脚，也不能依赖双换行拆回段落。
+        
+        会根据 task 中的 skip_references 和 skip_appendix 设置跳过相应部分。
         """
         batches: List[PageBatch] = []
         current_pages: List[int] = []
         current_layouts: List[PageLayout] = []
         current_items: List[TranslationUnit] = []
         current_text_len = 0
+        
+        # 重置section追踪状态
+        task.in_references_section = False
+        task.in_appendix_section = False
 
         def flush():
             nonlocal current_pages, current_layouts, current_items, current_text_len
@@ -262,6 +287,10 @@ class TranslationService:
                 for part_idx, render_block in enumerate(render_blocks):
                     text = render_block.text.strip()
                     if not text or not self._should_translate(text):
+                        continue
+                    
+                    # 检查是否应该跳过（参考文献/附录）
+                    if self._should_skip_block(text, task):
                         continue
 
                     starts_new_page = page_num not in current_pages
@@ -620,6 +649,90 @@ class TranslationService:
         if re.fullmatch(r"\s*(?:https?://|www\.)\S+\s*", text, re.IGNORECASE):
             return False
         return bool(re.search(r"[A-Za-z\u00C0-\u024F\u3040-\u30FF\u3400-\u9FFF]", text))
+    
+    @staticmethod
+    def _is_references_header(text: str) -> bool:
+        """检测是否为参考文献部分的标题"""
+        text_lower = text.strip().lower()
+        # 常见参考文献标题模式
+        patterns = [
+            r"^\s*references?\s*$",
+            r"^\s*bibliography\s*$",
+            r"^\s*works?\s+cited\s*$",
+            r"^\s*literature\s+cited\s*$",
+            r"^\s*cited\s+references?\s*$",
+            r"^\s*参考文献\s*$",
+            r"^\s*引用文献\s*$",
+            r"^\s*文献\s*$",
+            r"^\d+\.?\s*references?\s*$",  # 带编号的 "5. References"
+            r"^\d+\.?\s*bibliography\s*$",
+        ]
+        for pattern in patterns:
+            if re.match(pattern, text_lower, re.IGNORECASE):
+                return True
+        return False
+    
+    @staticmethod
+    def _is_appendix_header(text: str) -> bool:
+        """检测是否为附录部分的标题"""
+        text_lower = text.strip().lower()
+        # 常见附录标题模式
+        patterns = [
+            r"^\s*appendix\s*[a-z]?\s*$",
+            r"^\s*appendices\s*$",
+            r"^\s*appendix\s+\d*\s*$",
+            r"^\s*附录\s*[a-zA-Z0-9]*\s*$",
+            r"^\s*supplementary\s+materials?\s*$",
+            r"^\s*supplementary\s+information\s*$",
+            r"^\s*supporting\s+information\s*$",
+            r"^\d+\.?\s*appendix\s*[a-z]?\s*$",  # 带编号的 "A. Appendix"
+        ]
+        for pattern in patterns:
+            if re.match(pattern, text_lower, re.IGNORECASE):
+                return True
+        return False
+    
+    def _should_skip_block(
+        self, 
+        text: str, 
+        task: TranslationTask
+    ) -> bool:
+        """
+        检查是否应该跳过此文本块（基于参考文献/附录设置）
+        
+        同时会更新task中的section追踪状态
+        """
+        text_stripped = text.strip()
+        
+        # 检测是否进入参考文献部分
+        if self._is_references_header(text_stripped):
+            if task.skip_references:
+                task.in_references_section = True
+                return True
+            return False
+        
+        # 检测是否进入附录部分
+        if self._is_appendix_header(text_stripped):
+            if task.skip_appendix:
+                task.in_appendix_section = True
+                return True
+            return False
+        
+        # 如果已经在跳过的区域内，继续跳过
+        if task.in_references_section and task.skip_references:
+            # 检测是否离开参考文献部分（进入附录或其他主要章节）
+            if self._is_appendix_header(text_stripped):
+                task.in_references_section = False
+                if task.skip_appendix:
+                    task.in_appendix_section = True
+                    return True
+                return False
+            return True
+        
+        if task.in_appendix_section and task.skip_appendix:
+            return True
+        
+        return False
 
     @staticmethod
     def _split_fragmented_block(block: TextBlock) -> List[TextBlock]:

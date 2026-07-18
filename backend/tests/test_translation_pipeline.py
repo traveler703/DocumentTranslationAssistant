@@ -122,7 +122,17 @@ class TranslationMappingTests(unittest.IsolatedAsyncioTestCase):
             ],
         )
         service = TranslationService()
-        batches = service._create_translation_batches([layout])
+        task = TranslationTask(
+            task_id="task",
+            file_id="file",
+            source_path=Path("source.pdf"),
+            source_lang="en",
+            target_lang="zh-CN",
+            total_pages=1,
+            skip_references=False,
+            skip_appendix=False,
+        )
+        batches = service._create_translation_batches([layout], task)
 
         self.assertEqual(len(batches), 1)
         self.assertEqual(
@@ -131,14 +141,6 @@ class TranslationMappingTests(unittest.IsolatedAsyncioTestCase):
         )
 
         client = MarkerDroppingClient()
-        task = TranslationTask(
-            task_id="task",
-            file_id="file",
-            source_path=Path("source.pdf"),
-            source_lang="en",
-            target_lang="zh-CN",
-            total_pages=1,
-        )
         translated = await service._translate_single_batch(
             batches[0], client, task
         )
@@ -199,8 +201,6 @@ class TranslationMappingTests(unittest.IsolatedAsyncioTestCase):
             text_blocks=[block],
         )
         service = TranslationService()
-        batch = service._create_translation_batches([layout])[0]
-        client = ConciseLabelClient()
         task = TranslationTask(
             task_id="task",
             file_id="file",
@@ -208,7 +208,11 @@ class TranslationMappingTests(unittest.IsolatedAsyncioTestCase):
             source_lang="en",
             target_lang="zh-CN",
             total_pages=1,
+            skip_references=False,
+            skip_appendix=False,
         )
+        batch = service._create_translation_batches([layout], task)[0]
+        client = ConciseLabelClient()
 
         translated = await service._translate_single_batch(
             batch, client, task
@@ -226,7 +230,6 @@ class TranslationMappingTests(unittest.IsolatedAsyncioTestCase):
             text_blocks=[make_block("𝜋0-FAST", 0)],
         )
         service = TranslationService()
-        batch = service._create_translation_batches([layout])[0]
         task = TranslationTask(
             task_id="task",
             file_id="file",
@@ -234,7 +237,10 @@ class TranslationMappingTests(unittest.IsolatedAsyncioTestCase):
             source_lang="en",
             target_lang="zh-CN",
             total_pages=1,
+            skip_references=False,
+            skip_appendix=False,
         )
+        batch = service._create_translation_batches([layout], task)[0]
 
         translated = await service._translate_single_batch(
             batch, IdentityClient(), task

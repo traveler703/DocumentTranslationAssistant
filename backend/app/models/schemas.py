@@ -43,6 +43,9 @@ class TranslationRequest(BaseModel):
     api_key: Optional[str] = Field(default=None, description="API密钥（仅OpenAI需要）")
     api_base: Optional[str] = Field(default=None, description="API基础URL（可选）")
     model: Optional[str] = Field(default=None, description="模型名称（可选）")
+    skip_references: bool = Field(default=True, description="是否跳过参考文献部分")
+    skip_appendix: bool = Field(default=True, description="是否跳过附录部分")
+    original_filename: Optional[str] = Field(default=None, description="原始文件名")
 
 
 class LLMConfigRequest(BaseModel):
@@ -59,6 +62,7 @@ class FileUploadResponse(BaseModel):
     """文件上传响应"""
     file_id: str
     filename: str
+    original_filename: str
     size: int
     page_count: int
     message: str = "文件上传成功"

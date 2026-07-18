@@ -3,8 +3,9 @@
 """
 import uuid
 import hashlib
+import json
 from pathlib import Path
-from typing import Optional
+from typing import Optional, Dict, Any
 import aiofiles
 from fastapi import UploadFile
 
@@ -90,3 +91,48 @@ def format_file_size(size_bytes: int) -> str:
 def validate_language_code(lang_code: str) -> bool:
     """验证语言代码"""
     return lang_code in settings.SUPPORTED_LANGUAGES
+
+
+def get_metadata_path(file_id: str) -> Path:
+    """获取元数据文件路径"""
+    return settings.TEMP_DIR / f"{file_id}_metadata.json"
+
+
+def save_file_metadata(file_id: str, metadata: Dict[str, Any]) -> None:
+    """
+    保存文件元数据
+    
+    Args:
+        file_id: 文件ID
+        metadata: 元数据字典
+    """
+    metadata_path = get_metadata_path(file_id)
+    
+    # 如果已存在元数据，合并新数据
+    existing = get_file_metadata(file_id) or {}
+    existing.update(metadata)
+    
+    with open(metadata_path, 'w', encoding='utf-8') as f:
+        json.dump(existing, f, ensure_ascii=False, indent=2)
+
+
+def get_file_metadata(file_id: str) -> Optional[Dict[str, Any]]:
+    """
+    获取文件元数据
+    
+    Args:
+        file_id: 文件ID
+    
+    Returns:
+        元数据字典，如果不存在则返回None
+    """
+    metadata_path = get_metadata_path(file_id)
+    
+    if not metadata_path.exists():
+        return None
+    
+    try:
+        with open(metadata_path, 'r', encoding='utf-8') as f:
+            return json.load(f)
+    except (json.JSONDecodeError, IOError):
+        return None
